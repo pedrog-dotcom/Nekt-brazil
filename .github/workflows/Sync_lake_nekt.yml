@@ -29,11 +29,23 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements.txt   # precisa estar na raiz do repositório
+
+      - name: Listar arquivos do repositório
+        run: git ls-files
+
+      - name: Localizar o script
+        id: script
+        run: |
+          SCRIPT=$(git ls-files | grep -E '(^|/)sync_lake_nekt\.py$' | head -n 1)
+          if [ -z "$SCRIPT" ]; then
+            echo "::error::sync_lake_nekt.py não foi encontrado no repositório. Confira se ele foi commitado."
+            exit 1
+          fi
+          echo "Script encontrado em: $SCRIPT"
+          echo "path=$SCRIPT" >> "$GITHUB_OUTPUT"
 
       - name: Instalar dependências
-        run: pip install -r requirements.txt
+        run: pip install "google-cloud-bigquery==3.25.0" "requests==2.32.3"
 
       - name: Gravar credencial do Google
         env:
@@ -53,7 +65,7 @@ jobs:
           NEKT_WEBHOOK_API_KEY: ${{ secrets.NEKT_WEBHOOK_API_KEY }}
           NEKT_WEBHOOK_CUSTOMERS: ${{ secrets.NEKT_WEBHOOK_CUSTOMERS }}
           # adicione aqui um NEKT_WEBHOOK_<TABELA> para cada tabela nova
-        run: python sync_lake_nekt.py ${{ inputs.tables }}
+        run: python "${{ steps.script.outputs.path }}" ${{ inputs.tables }}
 
       - name: Apagar credencial
         if: always()
