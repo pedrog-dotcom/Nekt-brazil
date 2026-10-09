@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04     # fixo, para não mudar sozinho com a migração do ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v5
@@ -36,9 +36,15 @@ jobs:
       - name: Localizar o script
         id: script
         run: |
-          SCRIPT=$(git ls-files | grep -E '(^|/)sync_lake_nekt\.py$' | head -n 1)
+          # aceita qualquer combinação de maiúsculas/minúsculas e qualquer pasta
+          SCRIPT=$(git ls-files | grep -iE '(^|/)sync_lake_nekt\.py$' | head -n 1)
           if [ -z "$SCRIPT" ]; then
-            echo "::error::sync_lake_nekt.py não foi encontrado no repositório. Confira se ele foi commitado."
+            DUPLA=$(git ls-files | grep -iE 'sync_lake_nekt\.py\.[a-z]+$' | head -n 1)
+            if [ -n "$DUPLA" ]; then
+              echo "::error::Encontrei '$DUPLA'. A extensão está duplicada; renomeie para terminar só em .py."
+            else
+              echo "::error::Nenhum arquivo sync_lake_nekt.py no repositório. Veja a lista no passo 'Listar arquivos do repositório'."
+            fi
             exit 1
           fi
           echo "Script encontrado em: $SCRIPT"
