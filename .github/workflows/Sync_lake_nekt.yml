@@ -24,12 +24,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements.txt   # precisa estar na raiz do repositório
 
       - name: Instalar dependências
         run: pip install -r requirements.txt
@@ -37,7 +38,12 @@ jobs:
       - name: Gravar credencial do Google
         env:
           GCP_ADC_JSON: ${{ secrets.GCP_ADC_JSON }}
-        run: printf '%s' "$GCP_ADC_JSON" > "$RUNNER_TEMP/adc.json"
+        run: |
+          if [ -z "$GCP_ADC_JSON" ]; then
+            echo "::error::Secret GCP_ADC_JSON não configurado no repositório."
+            exit 1
+          fi
+          printf '%s' "$GCP_ADC_JSON" > "$RUNNER_TEMP/adc.json"
 
       - name: Sincronizar
         env:
