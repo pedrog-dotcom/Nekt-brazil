@@ -1,0 +1,54 @@
+name: Lake -> Nekt
+
+on:
+  schedule:
+    - cron: "0 9 * * *"   # todo dia 06:00 BRT: incremental
+    - cron: "0 8 * * 0"   # domingo 05:00 BRT: full refresh
+  workflow_dispatch:
+    inputs:
+      full_refresh:
+        description: "Reenviar as tabelas inteiras"
+        type: boolean
+        default: false
+      tables:
+        description: "Tabelas separadas por espaço (vazio = todas)"
+        type: string
+        default: ""
+
+concurrency:
+  group: lake-nekt
+  cancel-in-progress: false   # nunca roda duas sincronizações ao mesmo tempo
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Gravar credencial do Google
+        env:
+          GCP_ADC_JSON: ${{ secrets.GCP_ADC_JSON }}
+        run: printf '%s' "$GCP_ADC_JSON" > "$RUNNER_TEMP/adc.json"
+
+      - name: Sincronizar
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/adc.json
+          BQ_BILLING_PROJECT: enduring-coda-490721-k1
+          FULL_REFRESH: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 8 * * 0') || inputs.full_refresh == true }}
+          NEKT_WEBHOOK_API_KEY: ${{ secrets.NEKT_WEBHOOK_API_KEY }}
+          NEKT_WEBHOOK_CUSTOMERS: ${{ secrets.NEKT_WEBHOOK_CUSTOMERS }}
+          # adicione aqui um NEKT_WEBHOOK_<TABELA> para cada tabela nova
+        run: python sync_lake_nekt.py ${{ inputs.tables }}
+
+      - name: Apagar credencial
+        if: always()
+        run: rm -f "$RUNNER_TEMP/adc.json"
