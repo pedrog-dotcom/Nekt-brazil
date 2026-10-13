@@ -56,6 +56,27 @@ def brasil(coluna):
     """Filtro de Brasil tolerante a formatos diferentes (brazil, BRAZIL, BR, BRA)."""
     return f"LOWER(REPLACE({coluna}, '_', ' ')) IN ('brazil', 'br', 'bra')"
 
+# Promotion codes de CRM (aquisição). Comparação sem diferenciar maiúsculas.
+CUPONS_CRM = [
+    # Manual
+    "BR_CRM_40_OFF_ACQ",
+    "BR_CRM_35_OFF_ACQ",
+    "BR_CRM_30_OFF_ACQ",
+    "BR_CRM_45_OFF_ACQ",
+    # Voy
+    "voy_br_25_off_crm_acq",
+    "voy_br_30_off_crm_acq",
+    "voy_br_35_off_crm_acq",
+    "VOY_CRM_POPUP_40_OFF",
+    "voy_br_15_off_voyfriday_acq",
+    "VOY_BR_20_OFF_CRM_ACQ_ALWAYSON_CPS",
+    "VOY_BR_10_OFF_CRM_ACQ_ALWAYSON_CPS",
+]
+CUPONS_CRM_SQL = ", ".join(f"'{c.lower()}'" for c in CUPONS_CRM)
+
+# Quantos dias antes do checkout um envio ainda pode receber a atribuição.
+JANELA_TOQUES_DIAS = 30
+
 
 # ---------------------------------------------------------------------------
 # Tabelas. Para adicionar outra, copie um bloco, crie a source Webhook na Nekt
@@ -315,6 +336,104 @@ WHERE {brasil("j.country")}
   AND j.is_converted
   AND j.campaign_journey_started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 365 DAY)
 """ + FILTRO,
+    },
+    {
+        # Funil de e-mail por campanha (ou broadcast) e dia de envio, últimos 12 meses.
+        # Base para envios, entregas, aberturas e cliques por campanha na dash de CRM.
+        # Reprocessa 30 dias porque aberturas e cliques chegam depois do envio.
+        "name": "cio_email_daily",
+        "primary_key": "unique_key",
+        "incremental_column": "DATE(COALESCE(d.sent_at, d.delivery_created_at), 'America/Sao_Paulo')",
+        "incremental_por_data": True,
+        "lookback_days": 30,
+        "sql": f"""
+SELECT
+  TO_HEX(MD5(CONCAT(
+    CAST(DATE(COALESCE(d.sent_at, d.delivery_created_at), 'America/Sao_Paulo') AS STRING), '|',
+    IFNULL(d.brand, ''), '|',
+    IFNULL(d.cio_campaign_id, ''), '|', IFNULL(d.cio_newsletter_id, '')
+  ))) AS unique_key,
+  DATE(COALESCE(d.sent_at, d.delivery_created_at), 'America/Sao_Paulo') AS send_date,
+  d.brand,
+  d.cio_campaign_id,
+  d.cio_newsletter_id,
+  ANY_VALUE(COALESCE(d.campaign_name, d.newsletter_name)) AS campaign_name,
+  ANY_VALUE(d.campaign_purpose) AS campaign_purpose,
+  ANY_VALUE(d.campaign_group) AS campaign_group,
+  ANY_VALUE(d.campaign_taxonomy) AS campaign_taxonomy,
+  COUNT(*) AS deliveries,
+  COUNTIF(d.is_sent) AS sent,
+  COUNTIF(d.is_delivered) AS delivered,
+  COUNTIF(d.is_opened) AS opened,
+  COUNTIF(d.is_clicked) AS clicked,
+  COUNTIF(d.is_converted) AS converted_cio,
+  COUNTIF(d.is_unsubscribed) AS unsubscribed,
+  COUNT(DISTINCT d.customer_id) AS customers,
+  COUNT(DISTINCT IF(d.is_opened, d.customer_id, NULL)) AS customers_opened
+FROM `{LAKE}.dim_customerio_deliveries` AS d
+WHERE {brasil("d.country")}
+  AND LOWER(COALESCE(d.delivery_type, '')) = 'email'
+  AND d.cio_transactional_message_id IS NULL
+  AND COALESCE(d.sent_at, d.delivery_created_at) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 366 DAY)
+""" + FILTRO + """
+GROUP BY 1, 2, 3, 4, 5
+""",
+    },
+    {
+        # Toques de e-mail antes de cada aquisição com cupom de CRM, últimos 12 meses.
+        # Uma linha por pedido x envio: e-mails (de campanha ou broadcast) entregues até
+        # JANELA_TOQUES_DIAS antes do checkout. A regra de atribuição (última abertura,
+        # senão último envio) é aplicada numa transformação na Nekt.
+        # Incremental pelo checkout: pedidos dos últimos 3 dias são (re)enviados com seus toques.
+        "name": "cio_crm_order_touches",
+        "primary_key": "unique_key",
+        "incremental_column": "o.system_checkout_at",
+        "lookback_days": 3,
+        "sql": f"""
+WITH pedidos_crm AS (
+  SELECT
+    CAST(o.order_id AS STRING) AS order_id,
+    CAST(o.customer_id AS STRING) AS customer_id,
+    o.current_brand AS brand,
+    CAST(o.system_checkout_at AS TIMESTAMP) AS checkout_at,
+    p.promotion_code
+  FROM `{LAKE}.fct_orders` AS o
+  JOIN `{LAKE}.dim_promotions` AS p
+    ON CAST(p.promotion_coupon_id AS STRING) = CAST(o.promotion_coupon_id AS STRING)
+  WHERE {brasil("o.country")}
+    AND o.is_acquisition_order
+    AND LOWER(p.promotion_code) IN ({CUPONS_CRM_SQL})
+    AND CAST(o.system_checkout_at AS TIMESTAMP) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 365 DAY)
+    """ + FILTRO + f"""
+)
+SELECT
+  TO_HEX(MD5(CONCAT(pc.order_id, '|', d.cio_delivery_id))) AS unique_key,
+  pc.order_id,
+  pc.customer_id,
+  pc.brand,
+  pc.checkout_at,
+  pc.promotion_code,
+  d.cio_delivery_id,
+  d.cio_campaign_id,
+  d.cio_newsletter_id,
+  d.cio_action_id,
+  COALESCE(d.campaign_name, d.newsletter_name) AS campaign_name,
+  d.action_name,
+  d.campaign_purpose,
+  d.campaign_group,
+  d.sent_at,
+  d.delivered_at,
+  IF(d.opened_at < pc.checkout_at, d.opened_at, NULL) AS opened_at,
+  IF(d.clicked_at < pc.checkout_at, d.clicked_at, NULL) AS clicked_at
+FROM pedidos_crm AS pc
+JOIN `{LAKE}.dim_customerio_deliveries` AS d
+  ON CAST(d.customer_id AS STRING) = pc.customer_id
+WHERE {brasil("d.country")}
+  AND LOWER(COALESCE(d.delivery_type, '')) = 'email'
+  AND d.cio_transactional_message_id IS NULL
+  AND COALESCE(d.delivered_at, d.sent_at) < pc.checkout_at
+  AND COALESCE(d.delivered_at, d.sent_at) >= TIMESTAMP_SUB(pc.checkout_at, INTERVAL {JANELA_TOQUES_DIAS} DAY)
+""",
     },
 ]
 
