@@ -275,7 +275,7 @@ WHERE {brasil("s.country")}
         "name": "cio_campaign_journeys",
         "primary_key": "cio_campaign_journey_unique_key",
         "incremental_column": "j.campaign_journey_started_at",
-        "lookback_days": 30,          # conversões acontecem dias depois do envio
+        "lookback_days": 1,          # conversões acontecem dias depois do envio
         "full_semanal": False,        # tabela pesada: só reenvia inteira no full refresh manual
         "sql": f"""
 SELECT j.* EXCEPT (email, customer_identifier)
