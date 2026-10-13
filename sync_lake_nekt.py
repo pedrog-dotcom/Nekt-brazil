@@ -307,37 +307,6 @@ GROUP BY 1, 2, 3, 4
 """,
     },
     {
-        # Só as jornadas que converteram: liga campanha -> pedido, últimos 12 meses, sem e-mail.
-        "name": "cio_conversions",
-        "primary_key": "cio_campaign_journey_unique_key",
-        "incremental_column": "j.converted_at",
-        "lookback_days": 3,
-        "sql": f"""
-SELECT
-  j.cio_campaign_journey_unique_key,
-  j.cio_campaign_id,
-  j.customer_id,
-  j.brand,
-  j.campaign_name,
-  j.campaign_category,
-  j.campaign_taxonomy,
-  j.campaign_purpose,
-  j.campaign_group,
-  j.campaign_journey_started_at,
-  j.first_delivered_at,
-  j.converted_at,
-  j.days_to_convert_converting_delivery,
-  j.first_conversion_order_id,
-  j.first_conversion_task_id,
-  j.is_engaged,
-  j.customer_campaign_journey_rank
-FROM `{LAKE}.dim_customerio_campaign_journeys` AS j
-WHERE {brasil("j.country")}
-  AND j.is_converted
-  AND j.campaign_journey_started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 365 DAY)
-""" + FILTRO,
-    },
-    {
         # Funil de e-mail por campanha (ou broadcast) e dia de envio, últimos 12 meses.
         # Base para envios, entregas, aberturas e cliques por campanha na dash de CRM.
         # Reprocessa 30 dias porque aberturas e cliques chegam depois do envio.
