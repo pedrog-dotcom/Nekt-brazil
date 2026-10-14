@@ -56,13 +56,22 @@ def brasil(coluna):
     """Filtro de Brasil tolerante a formatos diferentes (brazil, BRAZIL, BR, BRA)."""
     return f"LOWER(REPLACE({coluna}, '_', ' ')) IN ('brazil', 'br', 'bra')"
 
-# Promotion codes de CRM (aquisição). Comparação sem diferenciar maiúsculas.
+# Promotion codes de CRM (aquisição e reativação), iguais aos da aba Pacing. Comparação sem diferenciar maiúsculas.
 CUPONS_CRM = [
-    # Manual
+    # Manual · aquisição
     "BR_CRM_40_OFF_ACQ",
     "BR_CRM_35_OFF_ACQ",
     "BR_CRM_30_OFF_ACQ",
     "BR_CRM_45_OFF_ACQ",
+    "BR_PAYDAY_MAY_40_OFF_ACQ",
+    # Manual · reativação (winback / churn)
+    "40AGORA",
+    "BR_CRM_20OFF_WINBACK",
+    "MANUAL_BR_CRM_45OFF_CHURN",
+    "BR_CRM_40_OFF_WINBACK",
+    "BR_PAYDAY_30_OFF_CHURN",
+    "BR_PAYDAY_35_OFF_CHURN",
+    "BR_PAYDAY_MAY_40_OFF_CHURN",
     # Voy
     "voy_br_25_off_crm_acq",
     "voy_br_30_off_crm_acq",
@@ -71,6 +80,7 @@ CUPONS_CRM = [
     "voy_br_15_off_voyfriday_acq",
     "VOY_BR_20_OFF_CRM_ACQ_ALWAYSON_CPS",
     "VOY_BR_10_OFF_CRM_ACQ_ALWAYSON_CPS",
+    "VOY_BR_CRM_20OFF_WINBACK",
 ]
 CUPONS_CRM_SQL = ", ".join(f"'{c.lower()}'" for c in CUPONS_CRM)
 
@@ -365,11 +375,17 @@ GROUP BY 1, 2, 3, 4, 5, 6, 7
         "incremental_column": "o.system_checkout_at",
         "lookback_days": 3,
         "sql": f"""
-WITH promos AS (
-  SELECT CAST(promotion_coupon_id AS STRING) AS promotion_coupon_id,
-         ANY_VALUE(promotion_code) AS promotion_code,
-         ANY_VALUE(promotion_coupon_code) AS promotion_coupon_code
-  FROM `{LAKE}.dim_promotions`
+WITH descontos AS (
+  -- Promotion code e cupom pelo DESCONTO APLICADO NOS ITENS do pedido (mesma fonte da aba Pacing).
+  -- Se o pedido tiver mais de um código, fica o de CRM; empate, o primeiro em ordem alfabética.
+  SELECT
+    CAST(ip.order_id AS STRING) AS order_id,
+    ARRAY_AGG(STRUCT(dd.promotion_code AS promotion_code, dd.promotion_coupon_code AS promotion_coupon_code)
+              ORDER BY IF(LOWER(dd.promotion_code) IN ({CUPONS_CRM_SQL}), 0, 1), dd.promotion_code
+              LIMIT 1)[OFFSET(0)] AS d
+  FROM `{LAKE}.dim_order_item_parents` AS ip
+  JOIN `{LAKE}.dim_order_item_discounts` AS dd ON dd.order_item_id = ip.order_item_id
+  WHERE dd.promotion_code IS NOT NULL
   GROUP BY 1
 ),
 pedidos AS (
@@ -377,18 +393,20 @@ pedidos AS (
     CAST(o.order_id AS STRING) AS order_id,
     CAST(o.order_number AS STRING) AS order_number,
     CAST(o.customer_id AS STRING) AS customer_id,
-    o.current_brand AS brand,
+    IF(o.brand_at_checkout = 'Manual', 'MANUAL', o.brand_at_checkout) AS brand,
     CAST(o.system_checkout_at AS TIMESTAMP) AS checkout_at,
     CAST(o.payment_completed_at AS TIMESTAMP) AS completed_at,
     o.order_context,
     o.is_confirmed,
     o.is_acquisition_order,
-    p.promotion_code,
-    p.promotion_coupon_code
+    ds.d.promotion_code AS promotion_code,
+    ds.d.promotion_coupon_code AS promotion_coupon_code
   FROM `{LAKE}.fct_orders` AS o
-  LEFT JOIN promos AS p ON p.promotion_coupon_id = CAST(o.promotion_coupon_id AS STRING)
+  LEFT JOIN descontos AS ds ON ds.order_id = CAST(o.order_id AS STRING)
   WHERE {brasil("o.country")}
-    AND (o.is_acquisition_order OR o.order_context IN ('acquisition', 'unconfirmed-acquisition'))
+    AND o.order_context IN ('acquisition', 'unconfirmed-acquisition', 'reactivation', 'unconfirmed-reactivation',
+                            'incremental', 'unconfirmed-incremental')
+    AND LOWER(COALESCE(o.order_taxonomy_business_category, '')) <> 'ed'
     AND NOT COALESCE(o.is_internal_user, FALSE)
     AND CAST(o.system_checkout_at AS TIMESTAMP) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 365 DAY)
     """ + FILTRO + f"""
