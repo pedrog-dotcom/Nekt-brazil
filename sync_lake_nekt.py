@@ -404,8 +404,8 @@ pedidos AS (
   FROM `{LAKE}.fct_orders` AS o
   LEFT JOIN descontos AS ds ON ds.order_id = CAST(o.order_id AS STRING)
   WHERE {brasil("o.country")}
-    AND o.order_context IN ('acquisition', 'unconfirmed-acquisition', 'reactivation', 'unconfirmed-reactivation',
-                            'incremental', 'unconfirmed-incremental')
+    -- Só aquisição e reativação (pedidos recorrentes e incrementais ficam de fora)
+    AND o.order_context IN ('acquisition', 'unconfirmed-acquisition', 'reactivation', 'unconfirmed-reactivation')
     AND LOWER(COALESCE(o.order_taxonomy_business_category, '')) <> 'ed'
     AND NOT COALESCE(o.is_internal_user, FALSE)
     AND CAST(o.system_checkout_at AS TIMESTAMP) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 365 DAY)
