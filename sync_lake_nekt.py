@@ -307,9 +307,10 @@ GROUP BY 1, 2, 3, 4
 """,
     },
     {
-        # Funil de e-mail por campanha (ou broadcast) e dia de envio, últimos 12 meses.
-        # Base para envios, entregas, aberturas e cliques por campanha na dash de CRM.
+        # Funil de e-mail por campanha, ACTION e dia de envio (horário de Brasília), últimos 12 meses.
+        # Base para envios, entregas, aberturas e cliques por campanha/action na dash de CRM.
         # Reprocessa 30 dias porque aberturas e cliques chegam depois do envio.
+        # versao = 2: granularidade por action (linhas da versão 1, por campanha, são ignoradas na Nekt).
         "name": "cio_email_daily",
         "primary_key": "unique_key",
         "incremental_column": "DATE(COALESCE(d.sent_at, d.delivery_created_at), 'America/Sao_Paulo')",
@@ -318,15 +319,19 @@ GROUP BY 1, 2, 3, 4
         "sql": f"""
 SELECT
   TO_HEX(MD5(CONCAT(
+    'v2|',
     CAST(DATE(COALESCE(d.sent_at, d.delivery_created_at), 'America/Sao_Paulo') AS STRING), '|',
     IFNULL(d.brand, ''), '|',
-    IFNULL(d.cio_campaign_id, ''), '|', IFNULL(d.cio_newsletter_id, '')
+    IFNULL(d.cio_campaign_id, ''), '|', IFNULL(d.cio_newsletter_id, ''), '|', IFNULL(d.cio_action_id, '')
   ))) AS unique_key,
+  2 AS versao,
   DATE(COALESCE(d.sent_at, d.delivery_created_at), 'America/Sao_Paulo') AS send_date,
   d.brand,
   d.cio_campaign_id,
   d.cio_newsletter_id,
+  d.cio_action_id,
   ANY_VALUE(COALESCE(d.campaign_name, d.newsletter_name)) AS campaign_name,
+  ANY_VALUE(d.action_name) AS action_name,
   ANY_VALUE(d.campaign_purpose) AS campaign_purpose,
   ANY_VALUE(d.campaign_group) AS campaign_group,
   ANY_VALUE(d.campaign_taxonomy) AS campaign_taxonomy,
@@ -345,63 +350,97 @@ WHERE {brasil("d.country")}
   AND d.cio_transactional_message_id IS NULL
   AND COALESCE(d.sent_at, d.delivery_created_at) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 366 DAY)
 """ + FILTRO + """
-GROUP BY 1, 2, 3, 4, 5
+GROUP BY 1, 2, 3, 4, 5, 6, 7
 """,
     },
     {
-        # Toques de e-mail antes de cada aquisição com cupom de CRM, últimos 12 meses.
-        # Uma linha por pedido x envio: e-mails (de campanha ou broadcast) entregues até
-        # JANELA_TOQUES_DIAS antes do checkout. A regra de atribuição (última abertura,
-        # senão último envio) é aplicada numa transformação na Nekt.
-        # Incremental pelo checkout: pedidos dos últimos 3 dias são (re)enviados com seus toques.
+        # Resumo de toques de e-mail por PEDIDO DE AQUISIÇÃO (com ou sem cupom), últimos 12 meses.
+        # Uma linha por pedido (acquisition e unconfirmed-acquisition): último clique, última abertura
+        # e último envio de e-mail da MESMA marca nos JANELA_TOQUES_DIAS antes do checkout, com campanha
+        # e action de cada um. A regra de atribuição e a janela são aplicadas na Nekt e na dash.
+        # Incremental pelo checkout: pedidos dos últimos 3 dias são (re)enviados.
+        # versao = 2: uma linha por pedido (linhas da versão 1, uma por envio, são ignoradas na Nekt).
         "name": "cio_crm_order_touches",
         "primary_key": "unique_key",
         "incremental_column": "o.system_checkout_at",
         "lookback_days": 3,
         "sql": f"""
-WITH pedidos_crm AS (
+WITH promos AS (
+  SELECT CAST(promotion_coupon_id AS STRING) AS promotion_coupon_id,
+         ANY_VALUE(promotion_code) AS promotion_code,
+         ANY_VALUE(promotion_coupon_code) AS promotion_coupon_code
+  FROM `{LAKE}.dim_promotions`
+  GROUP BY 1
+),
+pedidos AS (
   SELECT
     CAST(o.order_id AS STRING) AS order_id,
+    CAST(o.order_number AS STRING) AS order_number,
     CAST(o.customer_id AS STRING) AS customer_id,
     o.current_brand AS brand,
     CAST(o.system_checkout_at AS TIMESTAMP) AS checkout_at,
-    p.promotion_code
+    CAST(o.payment_completed_at AS TIMESTAMP) AS completed_at,
+    o.order_context,
+    o.is_confirmed,
+    o.is_acquisition_order,
+    p.promotion_code,
+    p.promotion_coupon_code
   FROM `{LAKE}.fct_orders` AS o
-  JOIN `{LAKE}.dim_promotions` AS p
-    ON CAST(p.promotion_coupon_id AS STRING) = CAST(o.promotion_coupon_id AS STRING)
+  LEFT JOIN promos AS p ON p.promotion_coupon_id = CAST(o.promotion_coupon_id AS STRING)
   WHERE {brasil("o.country")}
-    AND o.is_acquisition_order
-    AND LOWER(p.promotion_code) IN ({CUPONS_CRM_SQL})
+    AND (o.is_acquisition_order OR o.order_context IN ('acquisition', 'unconfirmed-acquisition'))
+    AND NOT COALESCE(o.is_internal_user, FALSE)
     AND CAST(o.system_checkout_at AS TIMESTAMP) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 365 DAY)
     """ + FILTRO + f"""
+),
+toques AS (
+  SELECT
+    pc.order_id,
+    STRUCT(d.cio_campaign_id AS campaign_id, COALESCE(d.campaign_name, d.newsletter_name) AS campaign,
+           d.cio_action_id AS action_id, d.action_name AS action) AS m,
+    COALESCE(d.delivered_at, d.sent_at) AS entregue_at,
+    IF(d.opened_at < pc.checkout_at, d.opened_at, NULL) AS aberto_at,
+    IF(d.clicked_at < pc.checkout_at, d.clicked_at, NULL) AS clicado_at
+  FROM pedidos AS pc
+  JOIN `{LAKE}.dim_customerio_deliveries` AS d
+    ON CAST(d.customer_id AS STRING) = pc.customer_id
+   AND d.brand = pc.brand
+  WHERE {brasil("d.country")}
+    AND LOWER(COALESCE(d.delivery_type, '')) = 'email'
+    AND d.cio_transactional_message_id IS NULL
+    AND COALESCE(d.delivered_at, d.sent_at) < pc.checkout_at
+    AND COALESCE(d.delivered_at, d.sent_at) >= TIMESTAMP_SUB(pc.checkout_at, INTERVAL {JANELA_TOQUES_DIAS} DAY)
+    {{{{FILTRO_TOQUES}}}}
+),
+resumo AS (
+  SELECT
+    order_id,
+    ARRAY_AGG(IF(clicado_at IS NULL, NULL, STRUCT(m, clicado_at AS ts)) IGNORE NULLS ORDER BY clicado_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS clique,
+    ARRAY_AGG(IF(aberto_at IS NULL, NULL, STRUCT(m, aberto_at AS ts)) IGNORE NULLS ORDER BY aberto_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS abertura,
+    ARRAY_AGG(STRUCT(m, entregue_at AS ts) ORDER BY entregue_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS envio,
+    COUNT(*) AS emails_entregues,
+    COUNT(aberto_at) AS emails_abertos,
+    COUNT(clicado_at) AS emails_clicados
+  FROM toques
+  GROUP BY 1
 )
 SELECT
-  TO_HEX(MD5(CONCAT(pc.order_id, '|', d.cio_delivery_id))) AS unique_key,
-  pc.order_id,
-  pc.customer_id,
-  pc.brand,
-  pc.checkout_at,
-  pc.promotion_code,
-  d.cio_delivery_id,
-  d.cio_campaign_id,
-  d.cio_newsletter_id,
-  d.cio_action_id,
-  COALESCE(d.campaign_name, d.newsletter_name) AS campaign_name,
-  d.action_name,
-  d.campaign_purpose,
-  d.campaign_group,
-  d.sent_at,
-  d.delivered_at,
-  IF(d.opened_at < pc.checkout_at, d.opened_at, NULL) AS opened_at,
-  IF(d.clicked_at < pc.checkout_at, d.clicked_at, NULL) AS clicked_at
-FROM pedidos_crm AS pc
-JOIN `{LAKE}.dim_customerio_deliveries` AS d
-  ON CAST(d.customer_id AS STRING) = pc.customer_id
-WHERE {brasil("d.country")}
-  AND LOWER(COALESCE(d.delivery_type, '')) = 'email'
-  AND d.cio_transactional_message_id IS NULL
-  AND COALESCE(d.delivered_at, d.sent_at) < pc.checkout_at
-  AND COALESCE(d.delivered_at, d.sent_at) >= TIMESTAMP_SUB(pc.checkout_at, INTERVAL {JANELA_TOQUES_DIAS} DAY)
+  TO_HEX(MD5(CONCAT('v2|', pc.order_id))) AS unique_key,
+  2 AS versao,
+  pc.order_id, pc.order_number, pc.customer_id, pc.brand,
+  pc.checkout_at, pc.completed_at, pc.order_context, pc.is_confirmed, pc.is_acquisition_order,
+  pc.promotion_code, pc.promotion_coupon_code,
+  r.clique.ts AS clique_at, r.clique.m.campaign_id AS clique_campaign_id, r.clique.m.campaign AS clique_campaign,
+  r.clique.m.action_id AS clique_action_id, r.clique.m.action AS clique_action,
+  r.abertura.ts AS abertura_at, r.abertura.m.campaign_id AS abertura_campaign_id, r.abertura.m.campaign AS abertura_campaign,
+  r.abertura.m.action_id AS abertura_action_id, r.abertura.m.action AS abertura_action,
+  r.envio.ts AS envio_at, r.envio.m.campaign_id AS envio_campaign_id, r.envio.m.campaign AS envio_campaign,
+  r.envio.m.action_id AS envio_action_id, r.envio.m.action AS envio_action,
+  COALESCE(r.emails_entregues, 0) AS emails_entregues,
+  COALESCE(r.emails_abertos, 0) AS emails_abertos,
+  COALESCE(r.emails_clicados, 0) AS emails_clicados
+FROM pedidos AS pc
+LEFT JOIN resumo AS r USING (order_id)
 """,
     },
 ]
@@ -448,7 +487,19 @@ def montar_sql(table):
         else:
             filtro = (f"AND CAST({col} AS TIMESTAMP) >= "
                       f"TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {dias} DAY)")
-    return table["sql"].replace("{{FILTRO_INCREMENTAL}}", filtro)
+    # Filtro extra para tabelas de toques (dim_customerio_deliveries): limita a leitura de envios
+    # ao período que pode tocar os pedidos desta execução (reduz o volume lido no BigQuery).
+    janela = int(JANELA_TOQUES_DIAS) + 1
+    if e_full(table):
+        filtro_toques = (f"AND COALESCE(d.delivered_at, d.sent_at) >= "
+                         f"TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {365 + janela} DAY)")
+    else:
+        dias = int(table.get("lookback_days", 3)) + janela
+        filtro_toques = (f"AND COALESCE(d.delivered_at, d.sent_at) >= "
+                         f"TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {dias} DAY)")
+    return (table["sql"]
+            .replace("{{FILTRO_INCREMENTAL}}", filtro)
+            .replace("{{FILTRO_TOQUES}}", filtro_toques))
 
 
 def carregar_webhooks():
