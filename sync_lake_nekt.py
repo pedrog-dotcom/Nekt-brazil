@@ -80,6 +80,8 @@ CUPONS_CRM = [
     "voy_br_15_off_voyfriday_acq",
     "VOY_BR_20_OFF_CRM_ACQ_ALWAYSON_CPS",
     "VOY_BR_10_OFF_CRM_ACQ_ALWAYSON_CPS",
+    "VOY_BR_25_OFF_CRM_ACQ_ALWAYSON_CPS",
+    "VOY_BR_30_OFF_CRM_ACQ_ALWAYSON_CPS",
     "VOY_BR_CRM_20OFF_WINBACK",
 ]
 CUPONS_CRM_SQL = ", ".join(f"'{c.lower()}'" for c in CUPONS_CRM)
@@ -393,6 +395,12 @@ WITH descontos AS (
   WHERE dd.promotion_code IS NOT NULL
   GROUP BY 1
 ),
+clientes AS (
+  -- Id do cliente no Customer.io (igual ao dim_customer_cio_customer_id da aba AcquisitionsCRM / Pacing)
+  SELECT CAST(customer_id AS STRING) AS customer_id, ANY_VALUE(cio_customer_id) AS cio_customer_id
+  FROM `{LAKE}.dim_customer`
+  GROUP BY 1
+),
 pedidos AS (
   SELECT
     CAST(o.order_id AS STRING) AS order_id,
@@ -405,9 +413,11 @@ pedidos AS (
     o.is_confirmed,
     o.is_acquisition_order,
     ds.d.promotion_code AS promotion_code,
-    ds.d.promotion_coupon_code AS promotion_coupon_code
+    ds.d.promotion_coupon_code AS promotion_coupon_code,
+    cl.cio_customer_id AS cio_customer_id
   FROM `{LAKE}.fct_orders` AS o
   LEFT JOIN descontos AS ds ON ds.order_id = CAST(o.order_id AS STRING)
+  LEFT JOIN clientes AS cl ON cl.customer_id = CAST(o.customer_id AS STRING)
   WHERE {brasil("o.country")}
     -- Só aquisição e reativação (pedidos recorrentes e incrementais ficam de fora)
     AND o.order_context IN ('acquisition', 'unconfirmed-acquisition', 'reactivation', 'unconfirmed-reactivation')
@@ -455,7 +465,7 @@ SELECT
   r.tipo AS delivery_type,
   pc.order_id, pc.order_number, pc.customer_id, pc.brand,
   pc.checkout_at, pc.completed_at, pc.order_context, pc.is_confirmed, pc.is_acquisition_order,
-  pc.promotion_code, pc.promotion_coupon_code,
+  pc.promotion_code, pc.promotion_coupon_code, pc.cio_customer_id,
   r.clique.ts AS clique_at, r.clique.m.campaign_id AS clique_campaign_id, r.clique.m.campaign AS clique_campaign,
   r.clique.m.action_id AS clique_action_id, r.clique.m.action AS clique_action,
   r.abertura.ts AS abertura_at, r.abertura.m.campaign_id AS abertura_campaign_id, r.abertura.m.campaign AS abertura_campaign,
