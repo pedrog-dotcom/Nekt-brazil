@@ -320,7 +320,8 @@ GROUP BY 1, 2, 3, 4
         # Funil de e-mail por campanha, ACTION e dia de envio (horário de Brasília), últimos 12 meses.
         # Base para envios, entregas, aberturas e cliques por campanha/action na dash de CRM.
         # Reprocessa 30 dias porque aberturas e cliques chegam depois do envio.
-        # versao = 2: granularidade por action (linhas da versão 1, por campanha, são ignoradas na Nekt).
+        # versao = 3: granularidade por action e TIPO DE MENSAGEM (e-mail, push, sms, whatsapp...).
+        # Linhas de versões anteriores são ignoradas na Nekt.
         "name": "cio_email_daily",
         "primary_key": "unique_key",
         "incremental_column": "DATE(COALESCE(d.sent_at, d.delivery_created_at), 'America/Sao_Paulo')",
@@ -329,17 +330,19 @@ GROUP BY 1, 2, 3, 4
         "sql": f"""
 SELECT
   TO_HEX(MD5(CONCAT(
-    'v2|',
+    'v3|',
     CAST(DATE(COALESCE(d.sent_at, d.delivery_created_at), 'America/Sao_Paulo') AS STRING), '|',
     IFNULL(d.brand, ''), '|',
-    IFNULL(d.cio_campaign_id, ''), '|', IFNULL(d.cio_newsletter_id, ''), '|', IFNULL(d.cio_action_id, '')
+    IFNULL(d.cio_campaign_id, ''), '|', IFNULL(d.cio_newsletter_id, ''), '|', IFNULL(d.cio_action_id, ''), '|',
+    IFNULL(LOWER(d.delivery_type), '')
   ))) AS unique_key,
-  2 AS versao,
+  3 AS versao,
   DATE(COALESCE(d.sent_at, d.delivery_created_at), 'America/Sao_Paulo') AS send_date,
   d.brand,
   d.cio_campaign_id,
   d.cio_newsletter_id,
   d.cio_action_id,
+  LOWER(d.delivery_type) AS delivery_type,
   ANY_VALUE(COALESCE(d.campaign_name, d.newsletter_name)) AS campaign_name,
   ANY_VALUE(d.action_name) AS action_name,
   ANY_VALUE(d.campaign_purpose) AS campaign_purpose,
@@ -356,11 +359,11 @@ SELECT
   COUNT(DISTINCT IF(d.is_opened, d.customer_id, NULL)) AS customers_opened
 FROM `{LAKE}.dim_customerio_deliveries` AS d
 WHERE {brasil("d.country")}
-  AND LOWER(COALESCE(d.delivery_type, '')) = 'email'
+  AND LOWER(COALESCE(d.delivery_type, '')) NOT IN ('webhook', 'slack', '')
   AND d.cio_transactional_message_id IS NULL
   AND COALESCE(d.sent_at, d.delivery_created_at) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 366 DAY)
 """ + FILTRO + """
-GROUP BY 1, 2, 3, 4, 5, 6, 7
+GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
 """,
     },
     {
@@ -369,7 +372,9 @@ GROUP BY 1, 2, 3, 4, 5, 6, 7
         # e último envio de e-mail da MESMA marca nos JANELA_TOQUES_DIAS antes do checkout, com campanha
         # e action de cada um. A regra de atribuição e a janela são aplicadas na Nekt e na dash.
         # Incremental pelo checkout: pedidos dos últimos 3 dias são (re)enviados.
-        # versao = 2: uma linha por pedido (linhas da versão 1, uma por envio, são ignoradas na Nekt).
+        # versao = 3: uma linha por pedido e TIPO DE MENSAGEM (e-mail, push, sms, whatsapp...), com o último
+        # clique, abertura e envio daquele tipo. Pedido sem nenhum toque vem numa linha com tipo vazio.
+        # Linhas de versões anteriores são ignoradas na Nekt.
         "name": "cio_crm_order_touches",
         "primary_key": "unique_key",
         "incremental_column": "o.system_checkout_at",
@@ -414,6 +419,7 @@ pedidos AS (
 toques AS (
   SELECT
     pc.order_id,
+    LOWER(d.delivery_type) AS tipo,
     STRUCT(d.cio_campaign_id AS campaign_id, COALESCE(d.campaign_name, d.newsletter_name) AS campaign,
            d.cio_action_id AS action_id, d.action_name AS action) AS m,
     COALESCE(d.delivered_at, d.sent_at) AS entregue_at,
@@ -424,7 +430,7 @@ toques AS (
     ON CAST(d.customer_id AS STRING) = pc.customer_id
    AND d.brand = pc.brand
   WHERE {brasil("d.country")}
-    AND LOWER(COALESCE(d.delivery_type, '')) = 'email'
+    AND LOWER(COALESCE(d.delivery_type, '')) NOT IN ('webhook', 'slack', '')
     AND d.cio_transactional_message_id IS NULL
     AND COALESCE(d.delivered_at, d.sent_at) < pc.checkout_at
     AND COALESCE(d.delivered_at, d.sent_at) >= TIMESTAMP_SUB(pc.checkout_at, INTERVAL {JANELA_TOQUES_DIAS} DAY)
@@ -433,6 +439,7 @@ toques AS (
 resumo AS (
   SELECT
     order_id,
+    tipo,
     ARRAY_AGG(IF(clicado_at IS NULL, NULL, STRUCT(m, clicado_at AS ts)) IGNORE NULLS ORDER BY clicado_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS clique,
     ARRAY_AGG(IF(aberto_at IS NULL, NULL, STRUCT(m, aberto_at AS ts)) IGNORE NULLS ORDER BY aberto_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS abertura,
     ARRAY_AGG(STRUCT(m, entregue_at AS ts) ORDER BY entregue_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS envio,
@@ -440,11 +447,12 @@ resumo AS (
     COUNT(aberto_at) AS emails_abertos,
     COUNT(clicado_at) AS emails_clicados
   FROM toques
-  GROUP BY 1
+  GROUP BY 1, 2
 )
 SELECT
-  TO_HEX(MD5(CONCAT('v2|', pc.order_id))) AS unique_key,
-  2 AS versao,
+  TO_HEX(MD5(CONCAT('v3|', pc.order_id, '|', IFNULL(r.tipo, '')))) AS unique_key,
+  3 AS versao,
+  r.tipo AS delivery_type,
   pc.order_id, pc.order_number, pc.customer_id, pc.brand,
   pc.checkout_at, pc.completed_at, pc.order_context, pc.is_confirmed, pc.is_acquisition_order,
   pc.promotion_code, pc.promotion_coupon_code,
